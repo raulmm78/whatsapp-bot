@@ -1,404 +1,326 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi.responses import PlainTextResponse
 import os
-import json
 import requests
-import dateparser
-from datetime import datetime, timedelta, timezone
-
-from openai import OpenAI
+import json
+from datetime import datetime, timedelta
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from openai import OpenAI
 
-# -----------------------------------------------------
-# FASTAPI APP
-# -----------------------------------------------------
 app = FastAPI()
 
-# -----------------------------------------------------
-# ENV VARIABLES
-# -----------------------------------------------------
+# =========================
+# ENV VARS
+# =========================
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
-GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
-
-WHATSAPP_URL = f"https://graph.facebook.com/v20.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
-
-# Zona horaria (ajusta si hace falta)
-TZ = timezone(timedelta(hours=1))  # Europa/Madrid aproximado
-
-# OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+# =========================
+# RAG: TEXTO DE LA CLÍNICA
+# =========================
+CLINIC_KNOWLEDGE = """
+Clínica Dental Martínez
 
-# -----------------------------------------------------
-# GOOGLE CALENDAR: SERVICE
-# -----------------------------------------------------
+Dirección: Calle Ejemplo 123, Madrid.
+Servicios: Odontología general, implantes, ortodoncia, estética dental.
+Teléfono: 900 000 000
+Horario habitual: Lunes a Viernes, 10:00–14:00 y 16:00–20:00.
+Las citas se reservan siempre bajo disponibilidad mediante el calendario.
+Procura que el tono sea cálido, cercano y profesional.
+"""
+
+# =========================
+# GOOGLE CALENDAR
+# =========================
 def get_calendar_service():
-    """Devuelve el cliente de Google Calendar o None si falta configuración."""
-    try:
-        if not GOOGLE_CREDENTIALS_JSON or not GOOGLE_CALENDAR_ID:
-            print("Google Calendar no configurado (faltan env vars).")
-            return None
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        raise RuntimeError("Falta GOOGLE_SERVICE_ACCOUNT_JSON en las variables de entorno")
 
-        creds_info = json.loads(GOOGLE_CREDENTIALS_JSON)
-        creds = service_account.Credentials.from_service_account_info(
-            creds_info,
-            scopes=["https://www.googleapis.com/auth/calendar"]
-        )
-        service = build("calendar", "v3", credentials=creds, cache_discovery=False)
-        return service
-    except Exception as e:
-        print("Error creando servicio de Calendar:", e)
-        return None
+    data = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    creds = service_account.Credentials.from_service_account_info(
+        data,
+        scopes=["https://www.googleapis.com/auth/calendar"]
+    )
+    service = build("calendar", "v3", credentials=creds)
+    return service
 
 
-# -----------------------------------------------------
-# GOOGLE CALENDAR: CREAR CITA
-# -----------------------------------------------------
-def create_calendar_event(name: str, phone: str, when_dt: datetime):
+def is_slot_free(date_iso: str, time_24: str, duration_minutes: int = 60) -> bool:
     """
-    Crea una cita de 30 minutos en el calendario.
-    Devuelve un texto amigable con la info de la cita o mensaje de error.
+    date_iso: '2025-11-27'
+    time_24: '11:00'
     """
     service = get_calendar_service()
-    if service is None:
-        return "He intentado crear la cita, pero el calendario no está bien configurado todavía."
+    calendar_id = "primary"
 
-    # Normalizar a timezone
-    if when_dt.tzinfo is None:
-        when_dt = when_dt.replace(tzinfo=TZ)
+    start_dt = datetime.fromisoformat(f"{date_iso}T{time_24}:00")
+    end_dt = start_dt + timedelta(minutes=duration_minutes)
 
-    end_dt = when_dt + timedelta(minutes=30)
+    events = service.events().list(
+        calendarId=calendar_id,
+        timeMin=start_dt.isoformat() + "Z",
+        timeMax=end_dt.isoformat() + "Z",
+        singleEvents=True,
+        orderBy="startTime"
+    ).execute()
 
-    event_body = {
-        "summary": f"Cita dental - {name}",
-        "description": f"Cita creada por WhatsApp. Teléfono: {phone}",
+    return len(events.get("items", [])) == 0
+
+
+def create_appointment(name: str, date_iso: str, time_24: str):
+    service = get_calendar_service()
+    calendar_id = "primary"
+
+    start_dt = datetime.fromisoformat(f"{date_iso}T{time_24}:00")
+    end_dt = start_dt + timedelta(minutes=60)
+
+    event = {
+        "summary": f"Cita dental – {name}",
+        "description": "Cita reservada automáticamente por el bot de WhatsApp.",
         "start": {
-            "dateTime": when_dt.isoformat(),
+            "dateTime": start_dt.isoformat(),
             "timeZone": "Europe/Madrid",
         },
         "end": {
             "dateTime": end_dt.isoformat(),
             "timeZone": "Europe/Madrid",
-        }
+        },
     }
 
-    try:
-        event = service.events().insert(
-            calendarId=GOOGLE_CALENDAR_ID,
-            body=event_body
-        ).execute()
-
-        start_str = when_dt.strftime("%d/%m/%Y a las %H:%M")
-        return f"Cita creada para *{start_str}* ✅\nSi quieres cambiarla, escríbenos de nuevo."
-    except Exception as e:
-        print("Error creando evento:", e)
-        return "He intentado crear la cita pero ha habido un problema con el calendario."
+    created = service.events().insert(calendarId=calendar_id, body=event).execute()
+    return created
 
 
-# -----------------------------------------------------
-# GOOGLE CALENDAR: CITAS PENDIENTES POR TELÉFONO
-# -----------------------------------------------------
-def get_user_appointments(phone: str):
+def list_free_slots(date_iso: str):
     """
-    Busca citas futuras en el calendario que contengan el teléfono en la descripción.
-    Devuelve un texto en formato lista.
+    Devuelve huecos libres tipo ['10:00', '11:00', '16:00'] según horario estándar.
     """
+    possible_hours = ["10:00", "11:00", "12:00", "13:00",
+                      "16:00", "17:00", "18:00", "19:00"]
+    free = []
+    for h in possible_hours:
+        if is_slot_free(date_iso, h):
+            free.append(h)
+    return free
+
+
+def get_upcoming_appointments(limit: int = 5):
     service = get_calendar_service()
-    if service is None:
-        return "Ahora mismo no puedo consultar el calendario, pero puedo ayudarte igualmente con tus dudas."
+    calendar_id = "primary"
+    now = datetime.utcnow().isoformat() + "Z"
 
-    now = datetime.now(TZ).isoformat()
+    events_result = service.events().list(
+        calendarId=calendar_id,
+        timeMin=now,
+        maxResults=limit,
+        singleEvents=True,
+        orderBy="startTime",
+    ).execute()
 
-    try:
-        events_result = service.events().list(
-            calendarId=GOOGLE_CALENDAR_ID,
-            timeMin=now,
-            q=phone,
-            singleEvents=True,
-            orderBy="startTime"
-        ).execute()
+    events = events_result.get("items", [])
+    return events
 
-        events = events_result.get("items", [])
+# =========================
+# WHATSAPP
+# =========================
+def send_whatsapp_message(to: str, message: str):
+    url = f"https://graph.facebook.com/v20.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
 
-        if not events:
-            return "No veo ninguna cita futura a tu nombre/tu número en el calendario."
-
-        lines = ["Estas son tus próximas citas que veo en el sistema:"]
-        for ev in events:
-            start = ev["start"].get("dateTime") or ev["start"].get("date")
-            start_dt = dateparser.parse(start)
-            start_str = start_dt.strftime("%d/%m/%Y a las %H:%M") if start_dt else start
-            lines.append(f"• {ev.get('summary', 'Cita')} – {start_str}")
-
-        return "\n".join(lines)
-
-    except Exception as e:
-        print("Error consultando citas:", e)
-        return "Ha habido un problema al consultar tus citas. Intenta de nuevo más tarde."
-
-
-# -----------------------------------------------------
-# GOOGLE CALENDAR: HORAS LIBRES PARA UN DÍA
-# -----------------------------------------------------
-def get_free_slots_for_day(day: datetime):
-    """
-    Da una lista de horas libres en texto para un día concreto, usando FreeBusy.
-    Ventana simple: 10:00–14:00 cada 30 minutos.
-    """
-    service = get_calendar_service()
-    if service is None:
-        return None  # sin calendario
-
-    # Normalizar fecha
-    day = day.astimezone(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
-    start_of_day = day
-    end_of_day = day + timedelta(days=1)
-
-    body = {
-        "timeMin": start_of_day.isoformat(),
-        "timeMax": end_of_day.isoformat(),
-        "items": [{"id": GOOGLE_CALENDAR_ID}]
-    }
-
-    try:
-        fb = service.freebusy().query(body=body).execute()
-        busy = fb["calendars"][GOOGLE_CALENDAR_ID]["busy"]
-
-        # Ventana por defecto 10:00–14:00
-        current = day.replace(hour=10, minute=0)
-        end_window = day.replace(hour=14, minute=0)
-
-        free_slots = []
-        while current < end_window:
-            slot_end = current + timedelta(minutes=30)
-
-            overlap = False
-            for b in busy:
-                b_start = dateparser.parse(b["start"])
-                b_end = dateparser.parse(b["end"])
-                # Hay solapamiento si empieza antes del fin y termina después del inicio
-                if b_start < slot_end and b_end > current:
-                    overlap = True
-                    break
-
-            if not overlap:
-                free_slots.append(current.strftime("%H:%M"))
-
-            current = slot_end
-
-        if not free_slots:
-            return "Ese día parece estar completo en la franja 10:00–14:00 😕."
-
-        slots_text = "\n".join(f"🕒 {h}" for h in free_slots)
-        return (
-            "Disponibilidad aproximada para ese día (10:00–14:00):\n"
-            f"{slots_text}\n\n"
-            "Responde con la hora que prefieras, por ejemplo: *11:30*."
-        )
-
-    except Exception as e:
-        print("Error consultando FreeBusy:", e)
-        return None
-
-
-# -----------------------------------------------------
-# WEBHOOK VERIFICATION (GET)
-# -----------------------------------------------------
-@app.get("/webhook")
-async def verify(hub_mode: str = None, hub_challenge: str = None, hub_verify_token: str = None):
-    if hub_mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
-        return PlainTextResponse(content=hub_challenge, status_code=200)
-    return PlainTextResponse(content="Invalid verify token", status_code=403)
-
-
-# -----------------------------------------------------
-# ENVIAR MENSAJE A WHATSAPP
-# -----------------------------------------------------
-def send_whatsapp_message(to_number: str, message: str):
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
 
     payload = {
         "messaging_product": "whatsapp",
-        "to": to_number,
-        "text": {"body": message}
+        "to": to,
+        "text": {"body": message},
     }
 
-    print("Sending message:", json.dumps(payload, indent=2, ensure_ascii=False))
-    r = requests.post(WHATSAPP_URL, headers=headers, json=payload)
+    r = requests.post(url, headers=headers, json=payload)
     print("WhatsApp response:", r.status_code, r.text)
-    return r.status_code, r.text
+    return r.text
 
+# =========================
+# OPENAI: PLAN EN JSON
+# =========================
+def plan_from_ai(user_message: str) -> dict:
+    """
+    Le pedimos a OpenAI que nos devuelva SOLO un JSON con:
+    - intent: 'book' | 'check' | 'info'
+    - name: str | null
+    - date_iso: 'YYYY-MM-DD' | null
+    - time_24: 'HH:MM' | null
+    - extra: texto para ayudar a responder
+    """
+    system_msg = f"""
+Eres el asistente de la Clínica Dental Martínez.
+Conocimiento de la clínica:
+{CLINIC_KNOWLEDGE}
 
-# -----------------------------------------------------
-# RESPUESTA GENERAL CON OPENAI
-# -----------------------------------------------------
-def answer_with_openai(user_msg: str) -> str:
+Tu misión: interpretar lo que pide el usuario y devolver SOLO un JSON válido.
+NO expliques nada, no añadas texto fuera del JSON.
+"""
+
+    user_msg = f"""
+Usuario dice: "{user_message}"
+
+Devuelve un JSON con esta forma:
+
+{{
+  "intent": "book" | "check" | "info",
+  "name": "Nombre de la persona o null",
+  "date_iso": "YYYY-MM-DD o null",
+  "time_24": "HH:MM o null",
+  "extra": "texto breve en español para contexto interno"
+}}
+
+Reglas:
+- "book" si quiere reservar/modificar una cita.
+- "check" si quiere ver próximas citas o saber si tiene algo pendiente.
+- "info" si solo pregunta por servicios, horarios, etc.
+- Convierte expresiones como "mañana", "hoy", "el jueves", "28 de noviembre" a date_iso.
+- Convierte horas como "a las 11", "11 de la mañana", "6 de la tarde" a formato 24h HH:MM.
+"""
+
+    completion = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        temperature=0.1,
+    )
+
+    content = completion.choices[0].message.content
+    print("AI raw plan:", content)
+
+    # Intentamos parsear el JSON
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Eres un asistente amable de una clínica dental. "
-                        "Respondes siempre de forma cercana, clara y profesional. "
-                        "Si la pregunta es sobre citas, horarios o reservas, "
-                        "explica la información general y deja claro que las citas "
-                        "se gestionan a través del sistema de agenda integrado."
-                    )
-                },
-                {"role": "user", "content": user_msg}
-            ]
+        plan = json.loads(content)
+    except Exception as e:
+        print("Error parseando JSON del plan:", e)
+        plan = {
+            "intent": "info",
+            "name": None,
+            "date_iso": None,
+            "time_24": None,
+            "extra": "No he podido interpretar el JSON, actúa solo como informativo.",
+        }
+    return plan
+
+
+def build_reply_from_plan(plan: dict) -> str:
+    intent = plan.get("intent")
+    name = plan.get("name")
+    date_iso = plan.get("date_iso")
+    time_24 = plan.get("time_24")
+
+    # Sólo información, sin tocar calendario
+    if intent == "info" or (not date_iso and not time_24):
+        msg = plan.get("extra") or ""
+        return (
+            "Hola 👋, soy el asistente de la Clínica Dental Martínez.\n\n"
+            f"{msg}\n\nSi quieres reservar una cita, dime tu nombre, el día y la hora que prefieres."
         )
 
-        return response.choices[0].message.content
+    # Consultar próximas citas
+    if intent == "check":
+        events = get_upcoming_appointments()
+        if not events:
+            return "No veo citas próximas en el calendario. Si quieres, puedo ayudarte a reservar una 😊"
 
-    except Exception as e:
-        print("Error OpenAI:", e)
-        return "Parece que hay un problema técnico con el sistema 😔. Puedes intentarlo de nuevo más tarde."
+        lines = ["Estas son tus próximas citas en la clínica:"]
+        for ev in events:
+            start = ev["start"].get("dateTime", ev["start"].get("date"))
+            start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            local = start_dt.astimezone()  # usa zona local del servidor
+            lines.append(f"• {local.strftime('%d/%m/%Y %H:%M')} – {ev.get('summary', 'Cita')}")
+        return "\n".join(lines)
 
+    # Reserva de cita
+    if intent == "book" and date_iso and time_24 and name:
+        if is_slot_free(date_iso, time_24):
+            event = create_appointment(name, date_iso, time_24)
+            start = event["start"]["dateTime"]
+            start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            local = start_dt.astimezone()
+            fecha_str = local.strftime("%d/%m/%Y")
+            hora_str = local.strftime("%H:%M")
 
-# -----------------------------------------------------
-# WEBHOOK POST (MENSAJES ENTRANTES)
-# -----------------------------------------------------
+            return (
+                f"¡Perfecto, {name}! 🎉\n\n"
+                f"He reservado tu cita para el día {fecha_str} a las {hora_str} en la Clínica Dental Martínez.\n"
+                "Si necesitas cambiarla o tienes alguna duda, escríbeme por aquí."
+            )
+        else:
+            free = list_free_slots(date_iso)
+            if not free:
+                return (
+                    "Ese horario ya está ocupado y hoy no tengo huecos libres 😔.\n"
+                    "Si quieres, dime otro día u otra hora aproximada y miro de nuevo."
+                )
+            else:
+                slots_str = ", ".join(free)
+                return (
+                    "Ese horario ya está ocupado, pero tengo disponibles estos huecos:\n"
+                    f"{slots_str}\n\n"
+                    "Dime cuál te viene mejor y la reservamos 😊"
+                )
+
+    # Caso raro / fallback
+    return (
+        "He entendido que quieres hacer algo con tu cita, pero me falta algún dato "
+        "(nombre, día u hora). Por favor, dime algo como:\n\n"
+        "«Quiero una cita para el martes 3 de diciembre a las 11, mi nombre es Ana Pérez»."
+    )
+
+# =========================
+# WEBHOOK VERIFY (GET)
+# =========================
+@app.get("/webhook")
+async def verify_webhook(hub_mode: str = None, hub_challenge: str = None, hub_verify_token: str = None):
+    if hub_mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
+        return PlainTextResponse(content=hub_challenge, status_code=200)
+    return PlainTextResponse(content="Invalid verify token", status_code=403)
+
+# =========================
+# WEBHOOK (POST)
+# =========================
 @app.post("/webhook")
 async def webhook_handler(request: Request):
     data = await request.json()
-    print("\n\nIncoming webhook:")
-    print(json.dumps(data, indent=2, ensure_ascii=False))
+    print("Incoming:", json.dumps(data, indent=2, ensure_ascii=False))
 
     try:
         entry = data["entry"][0]
-        changes = entry["changes"][0]
-        value = changes["value"]
-        messages = value.get("messages")
+        changes = entry["changes"][0]["value"]
+        messages = changes.get("messages")
 
-        if not messages:
-            return JSONResponse({"status": "ignored"})
+        if messages:
+            msg = messages[0]
+            from_number = msg["from"]
+            text = msg["text"]["body"]
 
-        msg = messages[0]
-        from_number = msg["from"]
-        text = msg.get("text", {}).get("body", "").strip()
-        lower = text.lower()
-
-        # -------------------------------------------------
-        # 1) PETICIÓN: VER MIS CITAS
-        # -------------------------------------------------
-        check_words = ["mis citas", "tengo cita", "citas pendientes", "próxima cita", "proxima cita"]
-        if any(w in lower for w in check_words):
-            reply = get_user_appointments(from_number)
+            plan = plan_from_ai(text)
+            reply = build_reply_from_plan(plan)
             send_whatsapp_message(from_number, reply)
-            return {"status": "appointments"}
-
-        # -------------------------------------------------
-        # 2) INTENCIÓN DE RESERVA
-        # -------------------------------------------------
-        intent_words = ["cita", "agendar", "agenda", "hora", "reserva", "limpieza"]
-        is_booking_intent = any(w in lower for w in intent_words)
-
-        # EXTRAER POSIBLE NOMBRE
-        possible_name = None
-
-        if "," in text:
-            possible_name = text.split(",")[0].strip()
-
-        if "mi nombre es" in lower:
-            possible_name = text.lower().replace("mi nombre es", "").strip().title()
-
-        if lower.startswith("soy "):
-            possible_name = text[4:].strip().title()
-
-        # EXTRAER FECHA/HORA
-        parsed_dt = dateparser.parse(text, languages=["es"])
-        iso_date = None
-        if parsed_dt:
-            parsed_dt = parsed_dt.replace(tzinfo=TZ)
-            iso_date = parsed_dt.date()
-
-        if is_booking_intent:
-            # 2.1 Tenemos nombre y fecha/hora -> intentamos crear cita
-            if possible_name and iso_date:
-                # Si parsed_dt no tiene hora, ponemos 10:00
-                if parsed_dt.hour == 0 and parsed_dt.minute == 0:
-                    parsed_dt = datetime(
-                        year=parsed_dt.year,
-                        month=parsed_dt.month,
-                        day=parsed_dt.day,
-                        hour=10,
-                        minute=0,
-                        tzinfo=TZ
-                    )
-
-                # Mostrar disponibilidad de ese día de forma "visual"
-                slots_text = get_free_slots_for_day(parsed_dt)
-                if slots_text:
-                    send_whatsapp_message(
-                        from_number,
-                        f"Genial {possible_name} 😄\n"
-                        f"He detectado el día *{parsed_dt.strftime('%d/%m/%Y')}*.\n\n"
-                        f"{slots_text}"
-                    )
-                    # Nota: para versión simple todavía no usamos la hora elegida
-                    # El usuario probablemente responderá con algo tipo "11:30 mañana"
-                    # y volvemos a entrar por este mismo flujo con fecha+hora.
-                else:
-                    # Directamente intentamos crear cita
-                    result = create_calendar_event(possible_name, from_number, parsed_dt)
-                    send_whatsapp_message(from_number, result)
-
-                return {"status": "booking_with_name_and_date"}
-
-            # 2.2 Falta nombre
-            if iso_date and not possible_name:
-                send_whatsapp_message(
-                    from_number,
-                    "Genial 😊 Ya tengo el día. Ahora dime tu *nombre completo*, por favor."
-                )
-                return {"status": "need_name"}
-
-            # 2.3 Falta fecha
-            if possible_name and not iso_date:
-                send_whatsapp_message(
-                    from_number,
-                    f"Gracias {possible_name}. Ahora dime el *día exacto* en el que quieres venir."
-                )
-                return {"status": "need_date"}
-
-            # 2.4 Falta todo
-            send_whatsapp_message(
-                from_number,
-                "Será un placer ayudarte a agendar una cita 🦷\n"
-                "Dime por favor tu *nombre* y el *día* que te gustaría venir.\n"
-                "Ejemplo: *Carolina Rodríguez, mañana a las 18h*"
-            )
-            return {"status": "need_info"}
-
-        # -------------------------------------------------
-        # 3) RESPUESTA GENERAL CON IA
-        # -------------------------------------------------
-        ai_reply = answer_with_openai(text)
-        send_whatsapp_message(from_number, ai_reply)
-
-        return {"status": "ai_response"}
 
     except Exception as e:
-        print("Webhook error:", e)
-        return JSONResponse({"error": str(e)}, status_code=500)
+        print("Error manejando webhook:", e)
 
+    return {"status": "ok"}
 
-# -----------------------------------------------------
+# =========================
 # ROOT
-# -----------------------------------------------------
+# =========================
 @app.get("/")
-def root():
-    return {"status": "running", "message": "WhatsApp bot online 🚀"}
+def home():
+    return {"status": "running", "bot": "whatsapp-calendar-rag"}
