@@ -20,6 +20,9 @@ WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+# 👇 Nuevo: calendario donde quieres las citas
+GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # =========================
@@ -58,7 +61,7 @@ def is_slot_free(date_iso: str, time_24: str, duration_minutes: int = 60) -> boo
     time_24: '11:00'
     """
     service = get_calendar_service()
-    calendar_id = "primary"
+    calendar_id = GOOGLE_CALENDAR_ID  # 👈 antes era "primary"
 
     start_dt = datetime.fromisoformat(f"{date_iso}T{time_24}:00")
     end_dt = start_dt + timedelta(minutes=duration_minutes)
@@ -76,7 +79,7 @@ def is_slot_free(date_iso: str, time_24: str, duration_minutes: int = 60) -> boo
 
 def create_appointment(name: str, date_iso: str, time_24: str):
     service = get_calendar_service()
-    calendar_id = "primary"
+    calendar_id = GOOGLE_CALENDAR_ID  # 👈 antes era "primary"
 
     start_dt = datetime.fromisoformat(f"{date_iso}T{time_24}:00")
     end_dt = start_dt + timedelta(minutes=60)
@@ -95,6 +98,7 @@ def create_appointment(name: str, date_iso: str, time_24: str):
     }
 
     created = service.events().insert(calendarId=calendar_id, body=event).execute()
+    print("Evento creado en Google Calendar:", created.get("id"))
     return created
 
 
@@ -113,7 +117,7 @@ def list_free_slots(date_iso: str):
 
 def get_upcoming_appointments(limit: int = 5):
     service = get_calendar_service()
-    calendar_id = "primary"
+    calendar_id = GOOGLE_CALENDAR_ID  # 👈 antes era "primary"
     now = datetime.utcnow().isoformat() + "Z"
 
     events_result = service.events().list(
