@@ -1,5 +1,10 @@
 fastapi
-uvicorn[standard]
+uvicorn
 requests
-openai>=1.40.0
 python-dotenv
+openai
+dateparser
+google-api-python-client
+google-auth
+google-auth-httplib2
+google-auth-oauthlib
