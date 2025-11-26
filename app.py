@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Query
 from fastapi.responses import PlainTextResponse
 import os
 import requests
@@ -7,13 +7,19 @@ app = FastAPI()
 
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
-WHATSAPP_API_URL = "https://graph.facebook.com/v20.0/"  # versión estable
+WHATSAPP_API_URL = "https://graph.facebook.com/v20.0/"
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
 
 
 # ========== VERIFY WEBHOOK (GET) ==========
 @app.get("/webhook")
-async def verify_webhook(hub_mode: str = None, hub_challenge: str = None, hub_verify_token: str = None):
+async def verify_webhook(
+    hub_mode: str = Query(None, alias="hub.mode"),
+    hub_challenge: str = Query(None, alias="hub.challenge"),
+    hub_verify_token: str = Query(None, alias="hub.verify_token"),
+):
+    print("VERIFY:", hub_mode, hub_challenge, hub_verify_token)
+
     if hub_mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
         return PlainTextResponse(content=hub_challenge, status_code=200)
     return PlainTextResponse(content="Invalid verify token", status_code=403)
