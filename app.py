@@ -1,115 +1,77 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
 import os
-import httpx
-import openai
-
-
-# -------------------------
-# CONFIG
-# -------------------------
-
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
-WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-openai.api_key = OPENAI_API_KEY
+import requests
 
 app = FastAPI()
 
-
-# -------------------------
-# WEBHOOK VERIFICATION
-# -------------------------
-@app.get("/webhook", response_class=PlainTextResponse)
-async def verify(request: Request):
-    """
-    Meta envía GET con:
-    hub.mode
-    hub.verify_token
-    hub.challenge
-    """
-    mode = request.query_params.get("hub.mode")
-    token = request.query_params.get("hub.verify_token")
-    challenge = request.query_params.get("hub.challenge")
-
-    if mode == "subscribe" and token == VERIFY_TOKEN:
-        return challenge  # Meta requiere texto plano
-
-    return PlainTextResponse("Error: invalid token", status_code=403)
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
+WHATSAPP_API_URL = "https://graph.facebook.com/v20.0/"  # versión estable
+WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
 
 
-# -------------------------
-# RECEPCIÓN DE MENSAJES
-# -------------------------
+# ========== VERIFY WEBHOOK (GET) ==========
+@app.get("/webhook")
+async def verify_webhook(hub_mode: str = None, hub_challenge: str = None, hub_verify_token: str = None):
+    if hub_mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
+        return PlainTextResponse(content=hub_challenge, status_code=200)
+    return PlainTextResponse(content="Invalid verify token", status_code=403)
+
+
+# ========== RECEIVE MESSAGES (POST) ==========
 @app.post("/webhook")
 async def webhook_handler(request: Request):
     data = await request.json()
 
-    # Meta envía mensajes así:
-    # data["entry"][0]["changes"][0]["value"]["messages"][0]
+    # Debug
+    print("Incoming:", data)
+
+    # Comprobar estructura del webhook
     try:
-        entry = data.get("entry", [])[0]
-        changes = entry.get("changes", [])[0]
-        value = changes.get("value", {})
+        entry = data["entry"][0]
+        changes = entry["changes"][0]
+        value = changes["value"]
         messages = value.get("messages")
 
         if messages:
-            message = messages[0]
-            phone = message["from"]
-            text = message["text"]["body"]
+            phone_number_id = value["metadata"]["phone_number_id"]
+            msg = messages[0]
+            from_number = msg["from"]
+            text = msg["text"]["body"]
 
-            # Respuesta con OpenAI
-            reply = await generate_reply(text)
+            # Respuesta básica del bot (sin OpenAI)
+            reply_text = f"Bot activo 👍\nRecibí tu mensaje: {text}"
 
-            # Enviar mensaje por WhatsApp
-            await send_whatsapp_message(phone, reply)
+            send_whatsapp_message(from_number, reply_text)
 
     except Exception as e:
-        print("Error procesando mensaje:", e)
+        print("Error parsing message:", e)
 
     return {"status": "ok"}
 
 
-# -------------------------
-# OPENAI: GENERAR RESPUESTA
-# -------------------------
-async def generate_reply(user_text: str) -> str:
-    try:
-        response = openai.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system",
-                 "content": "Eres un chatbot amable y útil del negocio. Responde de forma clara y breve."},
-                {"role": "user", "content": user_text}
-            ]
-        )
-        return response.choices[0].message.content
-
-    except Exception as e:
-        print("Error con OpenAI:", e)
-        return "Lo siento, ahora mismo no puedo responder."
-
-
-# -------------------------
-# ENVIAR MENSAJE A WHATSAPP
-# -------------------------
-async def send_whatsapp_message(to_number: str, text: str):
-    url = f"https://graph.facebook.com/v17.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
-
+# ========== SEND MESSAGE TO WHATSAPP ==========
+def send_whatsapp_message(to, message):
+    url = f"{WHATSAPP_API_URL}{WHATSAPP_PHONE_NUMBER_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
         "Content-Type": "application/json"
     }
-
     payload = {
         "messaging_product": "whatsapp",
-        "to": to_number,
-        "type": "text",
-        "text": {"body": text}
+        "to": to,
+        "text": {"body": message}
     }
 
-    async with httpx.AsyncClient() as client:
-        r = await client.post(url, headers=headers, json=payload)
-        print("WhatsApp SEND status:", r.status_code, r.text)
+    print("Sending:", payload)
+
+    r = requests.post(url, headers=headers, json=payload)
+    print("WhatsApp response:", r.status_code, r.text)
+    return r.text
+
+
+# ROOT 404
+@app.get("/")
+async def root():
+    return {"status": "ok", "message": "WhatsApp bot is running"}
